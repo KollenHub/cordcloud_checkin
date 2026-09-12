@@ -161,9 +161,13 @@ def fetch_latest_verification_code(timeout_seconds=60, poll_interval=3, since_ti
     通过 POP3 收取最新邮件中的验证码。
     since_time: Unix 时间戳，只接受该时间之后的邮件（防止读取历史验证码）
     返回 (code: str | None, error: str | None)
+
+    注意：Gmail POP3 的邮件顺序不保证验证码在最后一封（可能被分类/延迟），
+    因此扫描最近 SCAN_COUNT 封邮件（从最新往回），而非只看最后一封。
     """
+    SCAN_COUNT = 10  # 每次扫描最近的邮件数
     deadline = time.time() + timeout_seconds
-    last_check_count = None
+    scanned_upto = 0  # 已扫描过的最小邮件序号（避免重复解析）
 
     while time.time() < deadline:
         try:
@@ -183,107 +187,113 @@ def fetch_latest_verification_code(timeout_seconds=60, poll_interval=3, since_ti
                 time.sleep(poll_interval)
                 continue
 
-            # 增量检测：无新邮件则等待
-            if last_check_count is not None and msg_count == last_check_count:
+            # 扫描范围：从最新一封往回，跳过已扫描过的
+            start = msg_count
+            end = max(scanned_upto + 1, msg_count - SCAN_COUNT + 1)
+            if start < end:
                 conn.quit()
                 time.sleep(poll_interval)
                 continue
 
-            last_check_count = msg_count
+            code_found = None
+            for idx in range(start, end - 1, -1):
+                resp, lines, octets = conn.retr(idx)
+                raw_email = b"\r\n".join(lines)
 
-            # 取最后一封
-            resp, lines, octets = conn.retr(msg_count)
-            raw_email = b"\r\n".join(lines)
-            conn.quit()
+                msg = email.message_from_bytes(raw_email)
+                subject = decode_mime_header(msg["Subject"] or "")
+                sender = decode_mime_header(msg["From"] or "")
+                date = msg.get("Date", "")
 
-            msg = email.message_from_bytes(raw_email)
-            subject = decode_mime_header(msg["Subject"] or "")
-            sender = decode_mime_header(msg["From"] or "")
-            date = msg.get("Date", "")
+                print(f"[POP3] 第{idx}封: 发件人={sender}, 主题={subject}, 时间={date}")
 
-            print(f"[POP3] 最新邮件: 发件人={sender}, 主题={subject}, 时间={date}")
+                # 时间过滤：跳过登录触发前收到的邮件，防止读取历史验证码
+                if since_time is not None and date:
+                    try:
+                        email_dt = parsedate_to_datetime(date)
+                        # 容忍 5 分钟时钟偏差
+                        if email_dt.timestamp() < since_time - 300:
+                            continue
+                    except Exception:
+                        pass  # 日期解析失败不阻塞
 
-            # 时间过滤：跳过登录触发前收到的邮件，防止读取历史验证码
-            if since_time is not None and date:
-                try:
-                    email_dt = parsedate_to_datetime(date)
-                    if email_dt.timestamp() < since_time:
-                        print(f"[POP3] ⏭ 邮件时间早于登录触发时间，等待新邮件...")
-                        time.sleep(poll_interval)
-                        continue
-                except Exception:
-                    pass  # 日期解析失败不阻塞
-
-            # 提取正文（优先纯文本，避免 HTML 噪声干扰）
-            text_parts = []
-            html_parts = []
-            if msg.is_multipart():
-                for part in msg.walk():
-                    content_type = part.get_content_type()
-                    if content_type not in ("text/plain", "text/html"):
-                        continue
-                    payload = part.get_payload(decode=True)
+                # 提取正文（优先纯文本，避免 HTML 噪声干扰）
+                text_parts = []
+                html_parts = []
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        content_type = part.get_content_type()
+                        if content_type not in ("text/plain", "text/html"):
+                            continue
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            charset = part.get_content_charset() or "utf-8"
+                            decoded = payload.decode(charset, errors="replace")
+                            if content_type == "text/plain":
+                                text_parts.append(decoded)
+                            else:
+                                html_parts.append(decoded)
+                else:
+                    payload = msg.get_payload(decode=True)
                     if payload:
-                        charset = part.get_content_charset() or "utf-8"
-                        decoded = payload.decode(charset, errors="replace")
-                        if content_type == "text/plain":
-                            text_parts.append(decoded)
-                        else:
-                            html_parts.append(decoded)
-            else:
-                payload = msg.get_payload(decode=True)
-                if payload:
-                    charset = msg.get_content_charset() or "utf-8"
-                    text_parts.append(payload.decode(charset, errors="replace"))
+                        charset = msg.get_content_charset() or "utf-8"
+                        text_parts.append(payload.decode(charset, errors="replace"))
 
-            # 纯文本优先（噪声少），再拼接 HTML
-            plain_body = "\n".join(text_parts)
-            full_body = plain_body + "\n" + "\n".join(html_parts)
+                # 纯文本优先（噪声少），再拼接 HTML
+                plain_body = "\n".join(text_parts)
+                full_body = plain_body + "\n" + "\n".join(html_parts)
 
-            # 从正文中提取验证码
-            # 策略：优先匹配数字验证码（站点要求6位数字），字母数字作为兜底
-            digit_patterns = [
-                # 紧邻 "验证码" 的 6 位数字（最精确）
-                (r"验证码[：:\s]*(?:是|为)?[：:\s]*(\d{6})", "6位数字紧邻验证码"),
-                # "code:" 后 6 位数字
-                (r"(?:code|Code|CODE)[：:\s]*(\d{6})", "6位数字紧邻code"),
-                # 正文中任意 6 位数字（大概率是验证码）
-                (r"(?<!\d)(\d{6})(?!\d)", "独立6位数字"),
-            ]
-            alphanum_patterns = [
-                # "验证码" 后 4-8 位字母数字（兜底）
-                (r"验证码[：:\s]*(?:是|为)?[：:\s]*([A-Za-z0-9]{4,8})", "4-8位字母数字紧邻验证码"),
-                # "code:" 后 4-8 位字母数字
-                (r"(?:code|Code|CODE)[：:\s]*([A-Za-z0-9]{4,8})", "4-8位字母数字紧邻code"),
-            ]
+                # 从正文中提取验证码
+                # 策略：优先匹配数字验证码（站点要求6位数字），字母数字作为兜底
+                digit_patterns = [
+                    # 紧邻 "验证码" 的 6 位数字（最精确）
+                    (r"验证码[：:\s]*(?:是|为)?[：:\s]*(\d{6})", "6位数字紧邻验证码"),
+                    # "code:" 后 6 位数字
+                    (r"(?:code|Code|CODE)[：:\s]*(\d{6})", "6位数字紧邻code"),
+                    # 正文中任意 6 位数字（大概率是验证码）
+                    (r"(?<!\d)(\d{6})(?!\d)", "独立6位数字"),
+                ]
+                alphanum_patterns = [
+                    # "验证码" 后 4-8 位字母数字（兜底）
+                    (r"验证码[：:\s]*(?:是|为)?[：:\s]*([A-Za-z0-9]{4,8})", "4-8位字母数字紧邻验证码"),
+                    # "code:" 后 4-8 位字母数字
+                    (r"(?:code|Code|CODE)[：:\s]*([A-Za-z0-9]{4,8})", "4-8位字母数字紧邻code"),
+                ]
 
-            def try_extract(body: str, label: str) -> str | None:
-                """在给定文本中尝试提取验证码，优先数字模式"""
-                for pattern, desc in digit_patterns + alphanum_patterns:
-                    match = re.search(pattern, body)
-                    if match:
-                        code = match.group(1)
-                        # 打印匹配上下文便于调试
-                        start = max(0, match.start() - 20)
-                        end = min(len(body), match.end() + 20)
-                        ctx = body[start:end].replace("\n", " ")
-                        print(f"[POP3] ✅ [{label}] {desc}: {_mask_code(code)} (上下文: ...{ctx}...)")
-                        return code
-                return None
+                def try_extract(body: str, label: str) -> str | None:
+                    """在给定文本中尝试提取验证码，优先数字模式"""
+                    for pattern, desc in digit_patterns + alphanum_patterns:
+                        match = re.search(pattern, body)
+                        if match:
+                            code = match.group(1)
+                            # 打印匹配上下文便于调试
+                            start_c = max(0, match.start() - 20)
+                            end_c = min(len(body), match.end() + 20)
+                            ctx = body[start_c:end_c].replace("\n", " ")
+                            print(f"[POP3] ✅ [{label}] {desc}: {_mask_code(code)} (上下文: ...{ctx}...)")
+                            return code
+                    return None
 
-            # 先搜纯文本，再搜全文
-            code = try_extract(plain_body, "纯文本")
-            if code is None:
-                code = try_extract(full_body, "全文")
-            if code is not None:
-                return code, None
+                # 先搜纯文本，再搜全文
+                code = try_extract(plain_body, "纯文本")
+                if code is None:
+                    code = try_extract(full_body, "全文")
+                if code is not None:
+                    code_found = code
+                    break
 
-            # 降级：打印正文前 500 字符供人工判断
-            print(f"[POP3] ⚠️ 未能自动提取验证码，纯文本前500字符:")
-            print(plain_body[:500])
-            if html_parts:
-                print(f"[POP3] HTML 前300字符:")
-                print(html_parts[0][:300])
+                # 降级：打印正文前 200 字符供人工判断（仅新邮件）
+                if idx == start:
+                    print(f"[POP3] ⚠️ 最新邮件未提取到验证码，纯文本前200字符:")
+                    print(plain_body[:200])
+
+            scanned_upto = start  # 记录本轮已扫描到的最新位置
+
+            if code_found is not None:
+                conn.quit()
+                return code_found, None
+
+            conn.quit()
 
         except Exception as e:
             print(f"[POP3] 连接错误: {e}")
@@ -369,28 +379,50 @@ def main():
             email_input.wait_for(state="visible", timeout=10000)
             passwd_input.wait_for(state="visible", timeout=10000)
 
-            # 先点击聚焦，确保页面 JS 的 autofocus/select-all 已完成
-            # force=True 绕过 pointer-events 检查（输入框中心可能被 <I> 图标覆盖）
-            email_input.click(force=True)
+            # 注意：此站点存在反自动化处理，locator.fill() 填入的值会在
+            # 下一次填充动作时被清空（先填的框保留、后填的被清）。必须用
+            # JS 一次性设值 + 派发 input/change 事件，两个框才能同时有值。
+            page.evaluate(
+                """([emailVal, passVal]) => {
+                    const setVal = (id, v) => {
+                        const el = document.getElementById(id);
+                        el.focus();
+                        el.value = v;
+                        el.dispatchEvent(new Event('input', {bubbles: true}));
+                        el.dispatchEvent(new Event('change', {bubbles: true}));
+                    };
+                    setVal('email', emailVal);
+                    setVal('passwd', passVal);
+                    document.activeElement.blur();
+                }""",
+                [CORDCLOUD_EMAIL, CORDCLOUD_PASSWORD],
+            )
             page.wait_for_timeout(500)
-            email_input.fill(CORDCLOUD_EMAIL, force=True)
 
-            passwd_input.click(force=True)
-            page.wait_for_timeout(500)
-            passwd_input.fill(CORDCLOUD_PASSWORD, force=True)
-
-            # 验证填入的值是否正确（防止全选/清空导致填入失败）
+            # 验证填入的值是否正确（防止设值失败）
             filled_email = email_input.input_value()
-            if filled_email != CORDCLOUD_EMAIL:
-                print(f"[Step 2] ⚠️ 邮箱填入不匹配 (期望={CORDCLOUD_EMAIL}, 实际={filled_email})，重试...")
-                email_input.click(force=True)
-                page.wait_for_timeout(300)
-                email_input.fill(CORDCLOUD_EMAIL, force=True)
+            filled_passwd = passwd_input.input_value()
+            if not filled_email or not filled_passwd:
+                print(f"[Step 2] ⚠️ 设值异常 (email={filled_email!r}, passwd={'有值' if filled_passwd else '空'})，JS 重试...")
+                page.evaluate(
+                    """([emailVal, passVal]) => {
+                        const setVal = (id, v) => {
+                            const el = document.getElementById(id);
+                            el.value = v;
+                            el.dispatchEvent(new Event('input', {bubbles: true}));
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                        };
+                        setVal('email', emailVal);
+                        setVal('passwd', passVal);
+                    }""",
+                    [CORDCLOUD_EMAIL, CORDCLOUD_PASSWORD],
+                )
                 filled_email = email_input.input_value()
-                if filled_email != CORDCLOUD_EMAIL:
-                    print(f"[Step 2] ❌ 邮箱重试仍失败: {filled_email}")
+                filled_passwd = passwd_input.input_value()
+                if not filled_email or not filled_passwd:
+                    print(f"[Step 2] ❌ 重试仍失败: email={filled_email!r}, passwd={'有值' if filled_passwd else '空'}")
                 else:
-                    print(f"[Step 2] ✅ 邮箱重试成功")
+                    print(f"[Step 2] ✅ 重试成功")
 
             print(f"[Step 2] 已填写: {CORDCLOUD_EMAIL}")
             results.append(f"[Step 2] 填写登录表单: {CORDCLOUD_EMAIL}")
@@ -436,7 +468,23 @@ def main():
                 save_page_state(page, "step3_2fa_page")
                 print("[Step 2] 正在从 POP3 收取验证码...")
 
-                code, error = fetch_latest_verification_code(timeout_seconds=90, since_time=login_click_time)
+                # 首轮收取（45s）。失败则点击"重新发送"再收一轮（60s），
+                # 应对首封验证码邮件丢失/延迟的情况。
+                code, error = fetch_latest_verification_code(timeout_seconds=45, since_time=login_click_time)
+                if not code:
+                    print("[Step 2] ⏳ 首轮未收到验证码，尝试点击'重新发送'...")
+                    try:
+                        resend_btn = page.locator("#resend-code")
+                        if resend_btn.is_visible():
+                            resend_click_time = time.time()
+                            resend_btn.click()
+                            print(f"[Step 2] 已点击重新发送 (触发时间: {time.strftime('%H:%M:%S', time.localtime(resend_click_time))})")
+                            code, error = fetch_latest_verification_code(
+                                timeout_seconds=60, since_time=resend_click_time
+                            )
+                    except Exception as e:
+                        print(f"[Step 2] ⚠️ 点击重新发送失败: {e}")
+
                 if error or not code:
                     print(f"[Step 2] ❌ {error}")
                     return
