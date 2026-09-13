@@ -106,7 +106,7 @@ def send_result_email(subject: str, body: str, image_path: str | None = None):
         if image_path:
             msg = MIMEMultipart("related")
             msg["From"] = SMTP_USERNAME
-            msg["To"] = CORDCLOUD_EMAIL
+            msg["To"] = SMTP_USERNAME
             msg["Subject"] = subject
             msg["Date"] = formatdate(localtime=True)
 
@@ -122,7 +122,7 @@ def send_result_email(subject: str, body: str, image_path: str | None = None):
         else:
             msg = MIMEText(body, "plain", "utf-8")
             msg["From"] = SMTP_USERNAME
-            msg["To"] = CORDCLOUD_EMAIL
+            msg["To"] = SMTP_USERNAME
             msg["Subject"] = subject
             msg["Date"] = formatdate(localtime=True)
 
@@ -133,9 +133,9 @@ def send_result_email(subject: str, body: str, image_path: str | None = None):
             server.starttls()
 
         server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.sendmail(SMTP_USERNAME, [CORDCLOUD_EMAIL], msg.as_string())
+        server.sendmail(SMTP_USERNAME, [SMTP_USERNAME], msg.as_string())
         server.quit()
-        print(f"[SMTP] ✅ 结果邮件已发送至 {CORDCLOUD_EMAIL}")
+        print(f"[SMTP] ✅ 结果邮件已发送至 {SMTP_USERNAME}")
     except Exception as e:
         print(f"[SMTP] ❌ 邮件发送失败: {e}")
 
